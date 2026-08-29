@@ -1,0 +1,31 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: pip install -r requirements-dev.txt
+      - name: unit, property and CLI tests
+        run: python -m pytest tests/ -q --timeout=400
+      - name: protocol harnesses
+        run: |
+          python tests/harnesses/attack.py
+          STEPS=2 SETTLE=30 python tests/harnesses/soak.py 30
+
+# Nothing here touches the real Tor network - there is no tor binary on the
+# runner and the tests refuse outbound connections. The parts that need real
+# tor are `python3 talkshit.py doctor` and `selftest`, which have to be run
+# by hand on a machine that has it.
