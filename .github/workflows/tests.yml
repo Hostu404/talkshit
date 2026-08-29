@@ -17,9 +17,39 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
+
       - run: pip install -r requirements-dev.txt
+
+      - name: what this runner looks like
+        run: |
+          python -c "import sys, os, platform; print(sys.version)"
+          python -c "import os; print('user', os.getuid(), 'term', os.environ.get('TERM'))"
+          which tor || echo "no tor on the runner - expected"
+
       - name: unit, property and CLI tests
-        run: python -m pytest tests/ -q --timeout=400
+        run: |
+          python -m pytest tests/ -q --timeout=400 \
+            --tb=short -rf --junitxml=results.xml
+
+      - name: what failed
+        if: failure()
+        run: |
+          python - <<'PY'
+          import xml.etree.ElementTree as ET, sys, os
+          if not os.path.exists("results.xml"):
+              sys.exit("no results file - the run died before pytest finished")
+          for case in ET.parse("results.xml").getroot().iter("testcase"):
+              for bad in list(case.findall("failure")) + list(case.findall("error")):
+                  print(f"\n=== {case.get('classname')}.{case.get('name')}")
+                  print((bad.get("message") or "")[:600])
+          PY
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: pytest-results-${{ matrix.python }}
+          path: results.xml
+
       - name: protocol harnesses
         run: |
           python tests/harnesses/attack.py
