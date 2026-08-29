@@ -184,14 +184,28 @@ class TestConcurrentAccess:
         def read():
             while not stop.is_set():
                 try:
-                    idx.rooms(); idx._compact()
+                    idx.rooms(); idx._compact(); idx.find("room1")
                 except Exception as exc:
                     errors.append(exc)
 
-        ths = [threading.Thread(target=announce) for _ in range(5)] + \
-              [threading.Thread(target=read) for _ in range(2)]
+        def churn():
+            while not stop.is_set():
+                try:
+                    idx._announce()
+                except Exception as exc:
+                    errors.append(exc)
+
+        # Heavier than it looks necessary on purpose. The lighter version of
+        # this test passed locally for days and only failed on CI, because a
+        # missed dict copy needs the reader and the writer to interleave on
+        # exactly the wrong line. More threads makes that likely rather than
+        # lucky.
+        idx.publish("mine", lambda: 4, "myfp")
+        ths = ([threading.Thread(target=announce) for _ in range(8)]
+               + [threading.Thread(target=read) for _ in range(4)]
+               + [threading.Thread(target=churn) for _ in range(2)])
         for t in ths: t.start()
-        time.sleep(6)
+        time.sleep(8)
         stop.set()
         for t in ths: t.join(timeout=30)
         idx.close()

@@ -3058,6 +3058,12 @@ class Index:
         self.announcers: dict[str, set] = {}              # name -> keys announcing it
         self.by_key: dict[str, set] = {}                  # key -> names it announces
         self.mine: str | None = None
+        # Six dicts, mutated by every link thread that carries an
+        # announcement and read by whoever is drawing the room list. Wrapping
+        # the odd iteration in list() was not enough: one uncopied line is a
+        # crash, and there is always one more. Reentrant because the handlers
+        # below call each other - _on_object into _compact into _forget.
+        self.lock = threading.RLock()
         self.started = time.time()
         self.fp = ""
         self.count_fn = lambda: 0
@@ -3077,29 +3083,33 @@ class Index:
         return announce_interval(len(self.entries)) * 4.0
 
     def _forget(self, name: str) -> None:
-        self.entries.pop(name, None)
-        self.fingerprints.pop(name, None)
-        self.claims.pop(name, None)
-        for key in self.announcers.pop(name, set()):
-            self.by_key.get(key, set()).discard(name)
+        with self.lock:
+            self.entries.pop(name, None)
+            self.fingerprints.pop(name, None)
+            self.claims.pop(name, None)
+            for key in self.announcers.pop(name, set()):
+                self.by_key.get(key, set()).discard(name)
 
     def _compact(self) -> None:
         """Drop expired rooms, then any announcer left with nothing to its
         name. The caps used to be enforced by clearing one table outright,
         which left the others pointing at rooms that no longer existed."""
-        now, ttl = time.time(), self.entry_ttl()
-        for name in [n for n, (_, seen) in list(self.entries.items())
-                     if now - seen >= ttl and n != self.mine]:
-            self._forget(name)
-        for key in [k for k, names in list(self.by_key.items()) if not names]:
-            del self.by_key[key]
+        with self.lock:
+            now, ttl = time.time(), self.entry_ttl()
+            for name in [n for n, (_, seen) in list(self.entries.items())
+                         if now - seen >= ttl and n != self.mine]:
+                self._forget(name)
+            for key in [k for k, names in list(self.by_key.items()) if not names]:
+                del self.by_key[key]
 
     def rooms(self) -> list[tuple[str, int]]:
         now, ttl = time.time(), self.entry_ttl()
-        for name in [n for n, (_, seen) in list(self.entries.items())
-                     if now - seen >= ttl]:
-            self._forget(name)
-        return sorted((n, c) for n, (c, _) in self.entries.items() if c > 0)
+        with self.lock:
+            for name in [n for n, (_, seen) in list(self.entries.items())
+                         if now - seen >= ttl]:
+                self._forget(name)
+            return sorted((n, c) for n, (c, _) in self.entries.items()
+                          if c > 0)
 
     def refresh(self) -> None:
         """Look for index peers again, then ask everyone what they know."""
@@ -3109,31 +3119,38 @@ class Index:
     def find(self, query: str) -> None:
         """Above a few hundred rooms nobody holds the whole list, so a search
         has to be asked rather than filtered locally."""
-        if query:
-            self.mesh.broadcast({"kind": "find", "q": query[:24],
-                                 "id": os.urandom(8).hex()})
+        with self.lock:
+            if query:
+                self.mesh.broadcast({"kind": "find", "q": query[:24],
+                                     "id": os.urandom(8).hex()})
 
     def publish(self, name: str, count_fn, fingerprint: str = "") -> None:
-        self.mine, self.count_fn, self.fp = name, count_fn, fingerprint
-        self.fingerprints[name] = fingerprint
-        self._announce()
+        with self.lock:
+            self.mine, self.count_fn, self.fp = name, count_fn, fingerprint
+            self.fingerprints[name] = fingerprint
+            self._announce()
 
     def unpublish(self, last_one_out: bool) -> None:
-        name, self.mine = self.mine, None
-        if name and last_one_out:
-            self.entries.pop(name, None)
-            self.mesh.broadcast({"kind": "drop", "room": name,
-                                 "id": os.urandom(8).hex()})
+        with self.lock:
+            name, self.mine = self.mine, None
+            if name and last_one_out:
+                self.entries.pop(name, None)
+                self.mesh.broadcast({"kind": "drop", "room": name,
+                                     "id": os.urandom(8).hex()})
 
     def _announce(self) -> None:
         if not self.mine:
             return
         count = max(1, min(ROOM_LIMIT, self.count_fn()))
-        self.entries[self.mine] = (count, time.time())
-        mine = base64.b64encode(self.mesh.ident.edpub).decode()
-        self.announcers.setdefault(self.mine, set()).add(mine)
-        self.by_key.setdefault(mine, set()).add(self.mine)
-        self.mesh.broadcast({"kind": "room", "room": self.mine, "n": count,
+        with self.lock:
+            name = self.mine
+            if not name:
+                return
+            self.entries[name] = (count, time.time())
+            mine = base64.b64encode(self.mesh.ident.edpub).decode()
+            self.announcers.setdefault(name, set()).add(mine)
+            self.by_key.setdefault(mine, set()).add(name)
+        self.mesh.broadcast({"kind": "room", "room": name, "n": count,
                              "fp": self.fp, "id": os.urandom(8).hex()})
 
     def _announce_loop(self) -> None:
@@ -3149,134 +3166,137 @@ class Index:
         the lot to every arrival is a flood in its own right. Repeated gossip
         fills the rest in, and an explicit search asks for what is missing."""
         now, ttl = time.time(), self.entry_ttl()
-        pool = [(n, c) for n, (c, seen) in list(self.entries.items())
-                if now - seen < ttl and (not query or query in n)]
+        with self.lock:
+            pool = [(n, c, sorted(self.announcers.get(n, ()))[:1],
+                     self.fingerprints.get(n, ""))
+                    for n, (c, seen) in self.entries.items()
+                    if now - seen < ttl and (not query or query in n)]
         random.shuffle(pool)
-        for name, count in pool[:PUSH_SAMPLE]:
-            said_by = sorted(self.announcers.get(name, ()))[:1]
+        for name, count, said_by, fingerprint in pool[:PUSH_SAMPLE]:
             # marked as hearsay. this is us repeating what somebody else said,
             # under our own signature, and an unmarked copy would make us look
             # like an announcer of a room we have never been in - which is why
             # a room used to outlive everyone in it
             link.send({"kind": "room", "room": name, "n": count, "fwd": True,
                        "by": said_by[0] if said_by else "",
-                       "fp": self.fingerprints.get(name, ""),
+                       "fp": fingerprint,
                        "id": os.urandom(8).hex()})
 
     def _on_object(self, obj: dict, link: Link) -> None:
-        kind = obj.get("kind")
-        if kind == "hello":
-            # whoever just arrived gets a sample of our list, and we ask for theirs
-            self._push_list(link)
-            link.send({"kind": "rooms?", "id": os.urandom(8).hex()})
-        elif kind == "rooms?":
-            self._push_list(link)
-        elif kind == "find":
-            self._push_list(link, clean_name(str(obj.get("q", ""))))
-        elif kind == "room":
-            # a name from the network is printed to a terminal, so strip it
-            # here rather than trusting whoever announced it
-            name = clean_name(str(obj.get("room", "")))
-            try:
-                count = int(obj.get("n", 0) or 0)
-            except (TypeError, ValueError, OverflowError):
-                return
-            if not name or not 0 < count <= ROOM_LIMIT or name == self.mine:
-                return
-            if obj.get("fwd"):
-                # hearsay seeds a room we had not heard of, and nothing more.
-                # it never refreshes one we already hold, or the room would be
-                # kept alive by people merely repeating each other, and it
-                # never counts as a claim on the name
-                now = time.time()
-                if name not in self.entries and len(self.entries) < MAX_ENTRIES:
-                    self.entries[name] = (count, now)
-                    # carry whoever actually announced it, so the room can
-                    # still be retired by them. without this a room learned
-                    # second hand had no owner on record and nothing could
-                    # ever take it off the list but the clock
-                    said_by = str(obj.get("by", ""))[:64]
-                    if said_by:
-                        # recorded so the room can still be retired by whoever
-                        # opened it - but NOT charged against their quota. this
-                        # field comes from whoever forwarded the listing, and
-                        # letting hearsay spend someone else's allowance let a
-                        # stranger fill it with junk and silence their real
-                        # rooms. a quota may only count what a peer said itself
-                        self.announcers.setdefault(name, set()).add(said_by)
-                return
-            sender = str(obj.get("from", ""))[:64]
-            if sender not in self.by_key and len(self.by_key) >= MAX_ENTRIES:
-                self._compact()
-                if len(self.by_key) >= MAX_ENTRIES:
+        with self.lock:
+            kind = obj.get("kind")
+            if kind == "hello":
+                # whoever just arrived gets a sample of our list, and we ask for theirs
+                self._push_list(link)
+                link.send({"kind": "rooms?", "id": os.urandom(8).hex()})
+            elif kind == "rooms?":
+                self._push_list(link)
+            elif kind == "find":
+                self._push_list(link, clean_name(str(obj.get("q", ""))))
+            elif kind == "room":
+                # a name from the network is printed to a terminal, so strip it
+                # here rather than trusting whoever announced it
+                name = clean_name(str(obj.get("room", "")))
+                try:
+                    count = int(obj.get("n", 0) or 0)
+                except (TypeError, ValueError, OverflowError):
                     return
-            mine = self.by_key.setdefault(sender, set())
-            if name not in mine and len(mine) >= INDEX_PER_KEY:
-                return                   # one announcer, a handful of rooms
-            fp = str(obj.get("fp", ""))[:16]
-            # A name goes to the room with the most people announcing it, not
-            # simply to whoever spoke first: otherwise one stranger could bind
-            # every good name before a real room ever appeared.
-            if name not in self.claims and len(self.claims) >= MAX_ENTRIES:
-                self._compact()
-                if name not in self.claims and len(self.claims) >= MAX_ENTRIES:
-                    return               # cap the tally, not just the listing
-            claims = self.claims.setdefault(name, {})
-            if fp not in claims and len(claims) >= 4:
-                return
-            holders = claims.setdefault(fp, set())
-            if len(holders) < 64:
-                holders.add(sender)
-            # A live room keeps its name. Counting announcers looked like the
-            # fair way to settle a clash, but signing keys are free to mint -
-            # forty of them took the name off a real room, replaced its
-            # headcount with a lie, and had the room's own updates refused
-            # from then on as the weaker claim. Incumbency cannot be minted.
-            incumbent = self.fingerprints.get(name)
-            last = self.entries.get(name, (0, 0.0))[1]
-            live = bool(incumbent) and time.time() - last < self.entry_ttl()
-            if live:
-                if incumbent != fp:
-                    return           # somebody is still standing in that room
-            else:
-                # nobody holds it, so the tally decides - and on a tie the
-                # newcomer takes it, or a name would stay pinned to a room
-                # that has been empty for hours
-                winner = max(list(claims),
-                             key=lambda f: (len(claims[f]), f != incumbent))
-                if fp != winner:
+                if not name or not 0 < count <= ROOM_LIMIT or name == self.mine:
                     return
-            self.fingerprints[name] = fp
-            if name not in self.entries and len(self.entries) >= MAX_ENTRIES:
-                # evict the stalest rather than refusing every new room, which
-                # would let one flooder freeze the whole list
-                self._compact()
-                if name not in self.entries and len(self.entries) >= MAX_ENTRIES:
-                    # fewest announcers first, staleness only as a tiebreak.
-                    # evicting purely by age throws out a real room having a
-                    # quiet minute in favour of a flooder's freshest invention
-                    others = [(len(self.announcers.get(n, ())), seen, n)
-                              for n, (_, seen) in self.entries.items()
-                              if n != self.mine]
-                    if not others:
+                if obj.get("fwd"):
+                    # hearsay seeds a room we had not heard of, and nothing more.
+                    # it never refreshes one we already hold, or the room would be
+                    # kept alive by people merely repeating each other, and it
+                    # never counts as a claim on the name
+                    now = time.time()
+                    if name not in self.entries and len(self.entries) < MAX_ENTRIES:
+                        self.entries[name] = (count, now)
+                        # carry whoever actually announced it, so the room can
+                        # still be retired by them. without this a room learned
+                        # second hand had no owner on record and nothing could
+                        # ever take it off the list but the clock
+                        said_by = str(obj.get("by", ""))[:64]
+                        if said_by:
+                            # recorded so the room can still be retired by whoever
+                            # opened it - but NOT charged against their quota. this
+                            # field comes from whoever forwarded the listing, and
+                            # letting hearsay spend someone else's allowance let a
+                            # stranger fill it with junk and silence their real
+                            # rooms. a quota may only count what a peer said itself
+                            self.announcers.setdefault(name, set()).add(said_by)
+                    return
+                sender = str(obj.get("from", ""))[:64]
+                if sender not in self.by_key and len(self.by_key) >= MAX_ENTRIES:
+                    self._compact()
+                    if len(self.by_key) >= MAX_ENTRIES:
                         return
-                    self._forget(min(others)[2])
-            self.entries[name] = (count, time.time())
-            self.announcers.setdefault(name, set()).add(sender)
-            mine.add(name)
-        elif kind == "drop":
-            name = clean_name(str(obj.get("room", "")))
-            sender = str(obj.get("from", ""))
-            # a drop only retires the sender's own claim. anyone can announce a
-            # room, so treating a drop as deletion would let a stranger clear
-            # the list by announcing a room and immediately dropping it
-            holders = self.announcers.get(name)
-            if not holders or sender not in holders:
-                return
-            holders.discard(sender)
-            self.by_key.get(sender, set()).discard(name)
-            if not holders:
-                self._forget(name)
+                mine = self.by_key.setdefault(sender, set())
+                if name not in mine and len(mine) >= INDEX_PER_KEY:
+                    return                   # one announcer, a handful of rooms
+                fp = str(obj.get("fp", ""))[:16]
+                # A name goes to the room with the most people announcing it, not
+                # simply to whoever spoke first: otherwise one stranger could bind
+                # every good name before a real room ever appeared.
+                if name not in self.claims and len(self.claims) >= MAX_ENTRIES:
+                    self._compact()
+                    if name not in self.claims and len(self.claims) >= MAX_ENTRIES:
+                        return               # cap the tally, not just the listing
+                claims = self.claims.setdefault(name, {})
+                if fp not in claims and len(claims) >= 4:
+                    return
+                holders = claims.setdefault(fp, set())
+                if len(holders) < 64:
+                    holders.add(sender)
+                # A live room keeps its name. Counting announcers looked like the
+                # fair way to settle a clash, but signing keys are free to mint -
+                # forty of them took the name off a real room, replaced its
+                # headcount with a lie, and had the room's own updates refused
+                # from then on as the weaker claim. Incumbency cannot be minted.
+                incumbent = self.fingerprints.get(name)
+                last = self.entries.get(name, (0, 0.0))[1]
+                live = bool(incumbent) and time.time() - last < self.entry_ttl()
+                if live:
+                    if incumbent != fp:
+                        return           # somebody is still standing in that room
+                else:
+                    # nobody holds it, so the tally decides - and on a tie the
+                    # newcomer takes it, or a name would stay pinned to a room
+                    # that has been empty for hours
+                    winner = max(list(claims),
+                                 key=lambda f: (len(claims[f]), f != incumbent))
+                    if fp != winner:
+                        return
+                self.fingerprints[name] = fp
+                if name not in self.entries and len(self.entries) >= MAX_ENTRIES:
+                    # evict the stalest rather than refusing every new room, which
+                    # would let one flooder freeze the whole list
+                    self._compact()
+                    if name not in self.entries and len(self.entries) >= MAX_ENTRIES:
+                        # fewest announcers first, staleness only as a tiebreak.
+                        # evicting purely by age throws out a real room having a
+                        # quiet minute in favour of a flooder's freshest invention
+                        others = [(len(self.announcers.get(n, ())), seen, n)
+                                  for n, (_, seen) in self.entries.items()
+                                  if n != self.mine]
+                        if not others:
+                            return
+                        self._forget(min(others)[2])
+                self.entries[name] = (count, time.time())
+                self.announcers.setdefault(name, set()).add(sender)
+                mine.add(name)
+            elif kind == "drop":
+                name = clean_name(str(obj.get("room", "")))
+                sender = str(obj.get("from", ""))
+                # a drop only retires the sender's own claim. anyone can announce a
+                # room, so treating a drop as deletion would let a stranger clear
+                # the list by announcing a room and immediately dropping it
+                holders = self.announcers.get(name)
+                if not holders or sender not in holders:
+                    return
+                holders.discard(sender)
+                self.by_key.get(sender, set()).discard(name)
+                if not holders:
+                    self._forget(name)
 
     def close(self) -> None:
         self.stop.set()

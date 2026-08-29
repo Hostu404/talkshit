@@ -265,7 +265,7 @@ One file, no build step:
 
 ```
 sha256sum talkshit.py
-5cd47142b9d4eec0739e1eb40dd6e0f37e91becf75c4225531aa33d6a70ce3d0
+dcc5ec474a60dca5ec5d2457a8cc6d5745ede8373661ee75d70d39a5116debbe
 ```
 
 ## Forks
