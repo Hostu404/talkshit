@@ -1,4 +1,4 @@
-# talk shit
+# talk shit ![tests](https://github.com/Hostu404/talkshit/actions/workflows/tests.yml/badge.svg)
 
 **Encrypted chatrooms with no server, no accounts, and no address to hand out. One Python file.**
 
