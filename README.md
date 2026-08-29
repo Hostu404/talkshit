@@ -1,4 +1,4 @@
-# talk shit ![tests](https://github.com/Hostu404/talkshit/actions/workflows/tests.yml/badge.svg)
+# talk shit
 
 **Encrypted chatrooms with no server, no accounts, and no address to hand out. One Python file.**
 
@@ -10,6 +10,7 @@ transcript, no room name, no keys, not even in your scrollback.
 python3 talkshit.py
 ```
 <img width="634" height="404" alt="image" src="https://github.com/user-attachments/assets/6522c10d-4549-4c6f-a4af-0d39e82e7d6f" />
+
 
 ---
 
