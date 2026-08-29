@@ -9,7 +9,6 @@ transcript, no room name, no keys, not even in your scrollback.
 ```
 python3 talkshit.py
 ```
-<img width="634" height="404" alt="image" src="https://github.com/user-attachments/assets/6522c10d-4549-4c6f-a4af-0d39e82e7d6f" />
 
 ---
 
@@ -307,5 +306,3 @@ way and keeps Tor's entry guards between runs, which Tor's own design considers 
 over time.
 
 `wipe` removes anything that's left.
-
-<img width="254" height="313" alt="image" src="https://github.com/user-attachments/assets/47c874a1-78f6-4118-8c50-42822fb2256c" />
