@@ -2221,7 +2221,7 @@ class Mesh:
         # find anybody can be answered with evidence rather than a guess
         self.probe_notes: collections.OrderedDict = collections.OrderedDict()
         self.seen: collections.OrderedDict = collections.OrderedDict()
-        self.rates: dict[str, collections.deque] = {}
+        self.rates: dict[tuple, collections.deque] = {}
         self.address: str | None = None      # what we publish, door or our own
         self.claimed: str | None = None      # set only if that is a door
         self.slot: int | None = None         # which door, so we can follow it
@@ -2942,19 +2942,27 @@ class Mesh:
 
     # -- messages ----------------------------------------------------------
 
-    def _flooding(self, sender: str) -> bool:
-        """Counted per identity, over bodies we had not already seen. Relayed
-        copies and other people's messages never count against you."""
+    def _flooding(self, sender: str, link: "Link | None" = None) -> bool:
+        """Counted per identity *per circuit*, over bodies we had not already
+        seen.
+
+        Per identity alone, an allowance could be spent by somebody else: a
+        member who kept a pile of your old messages could replay them down
+        their own circuit, fill your quota with your own words, and your next
+        real message would be dropped as flooding. Whoever handed it to us is
+        half of who is answerable for it - the same lesson as the duplicate
+        table, which needed the sender as well as the id."""
         if not sender:
             return False
         now = time.time()
+        who = (sender, id(link) if link is not None else 0)
         with self.lock:
-            recent = self.rates.get(sender)
+            recent = self.rates.get(who)
             if recent is None:
-                recent = self.rates[sender] = collections.deque()
+                recent = self.rates[who] = collections.deque()
             while recent and now - recent[0] >= RATE_WINDOW:
                 recent.popleft()
-            if len(self.rates) > MAX_ROSTER * 2:
+            if len(self.rates) > MAX_ROSTER * 4:
                 self.rates = {k: v for k, v in self.rates.items()
                               if v and now - v[-1] < RATE_WINDOW}
             if len(recent) >= RATE_LIMIT:
@@ -2977,6 +2985,15 @@ class Mesh:
             return
         sender = str(obj.get("from", ""))
         mid = str(obj.get("id", ""))
+        if not mid and obj.get("kind") in RELAYED:
+            # Nothing that travels may travel unnamed. Duplicate detection is
+            # the only thing stopping a relayed body going round the mesh for
+            # ever, and it is keyed on the id - so a signed message with no id
+            # skipped the check, was passed on, came back, and was passed on
+            # again. The rate limits cap how fast that spins, not whether it
+            # stops, and the circuit budget it eats is shared with everybody
+            # else's traffic.
+            return
         if mid:
             # Keyed on who said it as well as what they called it. On the id
             # alone, any member could silence anybody: relaying shows you the
@@ -2991,7 +3008,8 @@ class Mesh:
                 self.seen[fresh] = time.time()
                 if len(self.seen) > MAX_SEEN:
                     self._forget_seen()
-        if self._flooding(sender) or link.saturated() or link.minting(sender):
+        if (self._flooding(sender, link) or link.saturated()
+                or link.minting(sender)):
             return           # one identity, one circuit, or a mill of both
         link.useful = True
         if obj.get("kind") == "peers":

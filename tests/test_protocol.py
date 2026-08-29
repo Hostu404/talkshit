@@ -354,3 +354,88 @@ class TestTransientRendezvousFailures:
             assert mesh._probe([door], timeout=1.0) == [door]
         finally:
             mesh.stop.set(); mesh.close()
+
+
+class TestNothingTravelsUnnamed:
+    """Duplicate detection is the only thing stopping a relayed body going
+    round the mesh for ever, and it keys on the id. A signed message with no
+    id skipped the check entirely, was passed on, came back, and was passed
+    on again - a permanent loop from one member sending one message."""
+
+    @pytest.mark.parametrize("kind", sorted(ts.RELAYED))
+    def test_a_relayed_body_without_an_id_is_refused(
+            self, chat, fake_link, signed, room, kind):
+        link = fake_link(chat.mesh)
+        sent = []
+        chat.mesh.broadcast = lambda o, skip=None: sent.append(o)
+        body = signed(room, kind=kind, nick="m", text="x")
+        body.pop("id")
+        for _ in range(10):
+            link.seen_here.clear(); link.fresh.clear(); chat.mesh.rates.clear()
+            chat.mesh._dispatch(body, link)
+        assert sent == [], f"{kind} with no id was relayed {len(sent)} times"
+
+    def test_an_identified_body_is_relayed_exactly_once(
+            self, chat, fake_link, signed, room):
+        link = fake_link(chat.mesh)
+        sent = []
+        chat.mesh.broadcast = lambda o, skip=None: sent.append(o)
+        body = signed(room, kind="msg", nick="m", text="x")
+        for _ in range(5):
+            link.seen_here.clear(); chat.mesh.rates.clear()
+            chat.mesh._dispatch(body, link)
+        assert len(sent) == 1
+
+    @pytest.mark.parametrize("kind", ["hello", "kx", "peers", "here", "find"])
+    def test_link_local_kinds_still_need_no_id(self, chat, fake_link, signed,
+                                               room, kind):
+        link = fake_link(chat.mesh)
+        body = signed(room, kind=kind, nick="m")
+        body.pop("id")
+        chat.mesh._dispatch(body, link)      # must not raise
+
+
+class TestOneMemberCannotSpendAnothersAllowance:
+    """Rate limiting keyed on the sender alone let a member be silenced with
+    their own words: keep a pile of somebody's old messages, replay them down
+    your own circuit, fill their quota, and their next real message is dropped
+    as flooding."""
+
+    def _alice(self, room):
+        ident = ts.Identity()
+        def says(text):
+            o = {"kind": "msg", "nick": "alice", "text": text,
+                 "ts": time.time(), "id": os.urandom(8).hex(),
+                 "rm": room.fingerprint}
+            o["from"] = base64.b64encode(ident.edpub).decode()
+            o["sig"] = base64.b64encode(ident.sign(ts.signed_bytes(o))).decode()
+            return o
+        return ident, says
+
+    def test_replaying_someone_cannot_silence_them(self, chat, fake_link, room):
+        honest, attacker = fake_link(chat.mesh), fake_link(chat.mesh)
+        _, says = self._alice(room)
+        for body in [says(f"old {i}") for i in range(ts.RATE_LIMIT + 40)]:
+            attacker.seen_here.clear()
+            chat.mesh._dispatch(body, attacker)
+        drain(chat)
+        for i in range(10):
+            honest.seen_here.clear()
+            chat.mesh._dispatch(says(f"urgent {i}"), honest)
+        assert len(drain(chat, "msg")) == 10, (
+            "alice was silenced by a replay of her own traffic")
+
+    def test_a_flooder_is_still_capped_on_its_own_circuit(self, chat,
+                                                          fake_link, room):
+        link = fake_link(chat.mesh)
+        ident, says = self._alice(room)
+        who = base64.b64encode(ident.edpub).decode()
+        for _ in range(ts.RATE_LIMIT + 10):
+            chat.mesh._flooding(who, link)
+        assert chat.mesh._flooding(who, link) is True
+
+    def test_the_rate_table_stays_bounded(self, chat, fake_link, room):
+        links = [fake_link(chat.mesh) for _ in range(6)]
+        for i in range(4000):
+            chat.mesh._flooding(f"speaker{i % 500}", links[i % 6])
+        assert len(chat.mesh.rates) <= ts.MAX_ROSTER * 4
