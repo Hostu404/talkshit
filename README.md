@@ -308,3 +308,6 @@ way and keeps Tor's entry guards between runs, which Tor's own design considers 
 over time.
 
 `wipe` removes anything that's left.
+
+<img width="254" height="313" alt="image" src="https://github.com/user-attachments/assets/47c874a1-78f6-4118-8c50-42822fb2256c" />
+
