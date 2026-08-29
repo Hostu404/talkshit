@@ -218,6 +218,11 @@ share of the duplicate-detection table, so shouting can't push somebody else's m
 lookalike of one — before its usual owner arrives. Whoever came second is shown with a fingerprint
 attached, which tells you a clash happened but not who deserves the name.
 
+**Every room member can read every message.** The two encryption layers keep outsiders out and keep
+the wire unreadable — they do not stop the person relaying for you from reading what they relay.
+Messages are signed, so a relay cannot alter or forge one, but it holds the plaintext, the sender's
+key and the room tag while passing it on. That is inherent to flood routing with no server.
+
 **Relays can drop messages silently.** There are no acknowledgements. A member can also refuse to
 pass yours on, which costs you the peers behind them.
 
@@ -265,7 +270,7 @@ One file, no build step:
 
 ```
 sha256sum talkshit.py
-dcc5ec474a60dca5ec5d2457a8cc6d5745ede8373661ee75d70d39a5116debbe
+2b4d5b5bfded7e36b27b7ab67adcb9c2be8e7626a1f7281f66dde1fde570099e
 ```
 
 ## Forks
