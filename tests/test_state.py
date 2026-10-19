@@ -1,6 +1,6 @@
 """Filesystem, persistence and recovery. Clean state, create, corrupt,
 reload, wipe - and check permissions along the way."""
-import os, stat, sys, tempfile, shutil
+import os, stat, subprocess, sys, tempfile, shutil, time
 import pytest
 import talkshit as ts
 
@@ -118,14 +118,50 @@ class TestTempSweeping:
             if os.path.islink(link):
                 os.unlink(link)
 
-    def test_a_live_pid_lock_is_left_alone(self):
+    @staticmethod
+    def _old_home(owner=None, tor_pid=None):
+        """A temp home past the one-minute grace, the way a copy that has been
+        running a while looks to another one starting up. tor's lock file is
+        written empty, as tor really writes it."""
         d = tempfile.mkdtemp(prefix="ts-")
         os.makedirs(os.path.join(d, "tordata"), exist_ok=True)
-        with open(os.path.join(d, "tordata", "lock"), "w") as f:
-            f.write(str(os.getpid()))
+        open(os.path.join(d, "tordata", "lock"), "w").close()
+        if owner is not None:
+            with open(os.path.join(d, ts.OWNER_FILE), "w") as f:
+                f.write(str(owner))
+        if tor_pid is not None:
+            with open(os.path.join(d, "tordata", ts.TOR_PID_FILE), "w") as f:
+                f.write(f"{tor_pid}\n")
+        old = time.time() - 600
+        os.utime(d, (old, old))
+        return d
+
+    def test_a_running_copy_is_left_alone(self):
+        """Starting a second copy deleted the first one's tor data once it had
+        been running a minute: tor's lock file is empty, so it read as
+        abandoned."""
+        d = self._old_home(owner=os.getpid())
+        try:
+            ts.sweep_abandoned()
+            assert os.path.isdir(os.path.join(d, "tordata"))
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_a_running_tor_is_left_alone(self):
+        d = self._old_home(tor_pid=os.getpid())
         try:
             ts.sweep_abandoned()
             assert os.path.isdir(d)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_an_abandoned_home_is_swept(self):
+        dead = subprocess.Popen([sys.executable, "-c", "pass"])
+        dead.wait()
+        d = self._old_home(owner=dead.pid, tor_pid=dead.pid)
+        try:
+            ts.sweep_abandoned()
+            assert not os.path.exists(d)
         finally:
             shutil.rmtree(d, ignore_errors=True)
 

@@ -83,6 +83,11 @@ peers[1].unpublish(last_one_out=True)
 gone = wait(lambda: not any(n == "linux-chat" for n, _ in peers[3].rooms()), 60)
 print(f"  dropped from another peer's list : "
       + (f"yes, {gone:.0f}s" if gone >= 0 else "NO - still listed"))
+# and stays dropped: second-hand copies of the listing were still travelling -
+# the search above sent some - and each one used to put the room straight back
+time.sleep(15)
+back = any(n == "linux-chat" for p in peers + [lonely] for n, _ in p.rooms())
+print(f"  still gone fifteen seconds later  : " + ("NO - it came back" if back else "yes"))
 
 print("\n=== a stranger cannot evict real rooms by flooding ===")
 before = {n for n, _ in peers[3].rooms()}

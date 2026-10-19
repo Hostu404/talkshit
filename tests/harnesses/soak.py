@@ -147,7 +147,14 @@ def main(n=40):
     print(f"  roster size          : {min(c.count for c in chats)}"
           f"-{max(c.count for c in chats)} of {n}")
 
-    ok = min(reach) == 3 and sum(1 for a in doors if len(REG.get(a, [])) > 1) == 0
+    # Every door should end up held. Messages still get through when they are
+    # not, which is how a peer handing its door away after dialling itself
+    # went unnoticed here: 4 of 16 doors held, every delivery fine
+    doors_ok = on_doors >= min(ts.DOORS, n)
+    if not doors_ok:
+        print(f"  doors held           : only {on_doors} of {min(ts.DOORS, n)}")
+    ok = (min(reach) == 3 and doors_ok
+          and sum(1 for a in doors if len(REG.get(a, [])) > 1) == 0)
     for c in chats:
         c.close()
     print("\n  RESULT:", "pass" if ok else "FAIL")

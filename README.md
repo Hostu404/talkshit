@@ -71,7 +71,7 @@ python3 talkshit.py               browse rooms, search, create or join
 python3 talkshit.py join NAME     straight into a room by name, unlisted
 python3 talkshit.py doctor        check your Tor and report what works
 python3 talkshit.py selftest      two Tor instances, a real room, a real message
-python3 talkshit.py bridges       bridge settings, for networks that block Tor
+python3 talkshit.py -k bridges    bridge settings, for networks that block Tor (start with -k to use them)
 python3 talkshit.py wipe          remove anything it put on disk
 ```
 
@@ -123,14 +123,15 @@ and the old address stays up for ten minutes so nobody is cut off mid-dial.
 | | |
 |---|---|
 | Room key | scrypt, N=2¹⁶, r=8, p=1, salted with the room name |
-| Session keys | ephemeral X25519 per link → HKDF-SHA256 → two AES-256-GCM keys |
+| Session keys | ephemeral X25519 per circuit → HKDF-SHA256 → two AES-256-GCM keys |
 | Authenticity | Ed25519 on every message, with the room's fingerprint inside the signature |
 | Padding | bodies padded to a multiple of 256 bytes |
 | Doors | Ed25519, derived per slot per hour |
 | Circuits | one SOCKS isolation bundle per room, so rooms don't share circuits |
 
-Session keys live only in memory and die with the process. That's what makes the traffic forward
-secret.
+Every circuit makes its own X25519 key pair and throws the private half away as soon as keys are
+agreed. The agreed keys live only in memory and die with the circuit. That's what makes the traffic
+forward secret.
 
 ## What's been tested
 
@@ -155,11 +156,18 @@ found:
   "no such onion", but the code lumped it in with "occupied, move on" and never knocked again — so
   the one door with somebody behind it was abandoned while the other fifteen were re-checked.
 
-Both are fixed, and `selftest` now prints what every door said when it fails, so the next surprise
+A later round, over a meek bridge, found a third. After a failed rendezvous, Tor can answer `0xF0`,
+"no such onion", for a door whose descriptor it has already fetched. A peer who knocked moments after
+a door was claimed read it as empty, opened a door of its own, and spent several minutes on other
+doors before knocking there again. A door now counts as free only if Tor also holds no descriptor
+for it. Before the fix, five of seven runs failed this way; the three runs since have all passed,
+one of them through exactly this failure.
+
+All three are fixed, and `selftest` now prints what every door said when it fails, so the next surprise
 comes with evidence attached instead of guesswork. On Linux and Windows, `doctor` confirms extended SOCKS errors, unused
 doors reporting `0xF0` in 4–7s, and published addresses matching what the passphrase derives.
 
-**A test suite** of 342 tests in `tests/` — helpers, crypto, protocol, state, CLI, concurrency,
+**A test suite** of 398 tests in `tests/` — helpers, crypto, protocol, state, CLI, concurrency,
 security, plus Hypothesis property tests. Targeted mutation testing detects 18/18 deliberate bugs.
 
 **In a loopback harness** running the real mesh, links and crypto:
@@ -171,7 +179,8 @@ security, plus Hypothesis property tests. Targeted mutation testing detects 18/1
   lookalike handles, large rooms uncapped
 - ~80,000 hostile inputs through every parser and message handler, no unhandled exception
 - No thread, socket or onion-service leaks across repeated join/leave cycles
-- Clocks up to two hours apart still find the same room
+- Clocks up to two hours apart still find the same room (talking needs them within five minutes;
+  see Known limits)
 
 **Not yet tested:** two machines on two networks. `selftest` covers the onion path with two
 independent Tor instances, but nobody has run it across real machines. And anything above 30 peers —
@@ -192,6 +201,11 @@ out offline. Generated ones are 60 bits, and each guess costs an attacker a 64 M
 centuries for someone with a hundred thousand GPUs. Hand-picked phrases are the soft spot: obvious
 ones are refused, but a wordlist this small can't catch everything, so take the generated one.
 Anyone holding the phrase is a member forever — removing someone means a new passphrase.
+
+**Clocks have to agree within five minutes.** Every message carries the time it was sent, and
+anything more than five minutes out is refused — that window is what stops an old message being
+replayed. Two people whose clocks are further apart still find each other, but neither sees the
+other's messages; the chat says so, and setting the right time fixes it.
 
 **Timing leaks.** Contents and lengths are hidden; *when* bytes move is not. Someone watching many
 points in the network at once can correlate your bursts against everyone else's. Tor doesn't defend
@@ -216,8 +230,10 @@ old line look freshly said. Peers who already saw it aren't fooled — each spea
 share of the duplicate-detection table, so shouting can't push somebody else's messages out of it.
 
 **Handles are first come, first served.** There's no registration, so someone can take a name — or a
-lookalike of one — before its usual owner arrives. Whoever came second is shown with a fingerprint
-attached, which tells you a clash happened but not who deserves the name.
+lookalike of one — before its usual owner arrives. Whoever came second is shown with a short tag from
+their key attached (`alice~3dc5`), which tells you a clash happened but not who deserves the name. A tag
+that's already on screen grows until it's unique, so a key ground to match one can't share it.
+`/who` shows each person's 16-character fingerprint, to compare out of band.
 
 **Every room member can read every message.** The two encryption layers keep outsiders out and keep
 the wire unreadable — they do not stop the person relaying for you from reading what they relay.
@@ -271,7 +287,7 @@ One file, no build step:
 
 ```
 sha256sum talkshit.py
-2b4d5b5bfded7e36b27b7ab67adcb9c2be8e7626a1f7281f66dde1fde570099e
+6b2c86231193958e26ffb4cabb3d15ad26ad2c886cfe1142486d4e9113521569
 ```
 
 ## Forks
@@ -284,7 +300,7 @@ to both sides. Bump `PROTOCOL` when you change the wire format and peers will sa
 
 ```
 pip install -r requirements-dev.txt
-python3 -m pytest tests/ -q --timeout=400        # 349 tests
+python3 -m pytest tests/ -q --timeout=400        # 398 tests
 python3 tests/harnesses/attack.py                # adversarial protocol checks
 STEPS=2 SETTLE=30 python3 tests/harnesses/soak.py 30
 ```

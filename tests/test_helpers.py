@@ -85,6 +85,18 @@ class TestFolded:
         assert isinstance(ts.folded(raw), str)
 
 
+# ----------------------------------------------------------------- walks
+class TestKeyboardWalks:
+    @pytest.mark.parametrize("phrase", ["123456789012", "qwertyuiopas",
+                                        "zyxwvutsrqpo", "098765432109", "abcdefgh1234"])
+    def test_a_run_along_the_keyboard_or_alphabet_is_refused(self, phrase):
+        assert ts.weak_passphrase(phrase, "lounge")
+
+    def test_generated_passphrases_are_never_mistaken_for_one(self):
+        assert not any(ts.weak_passphrase(ts.new_passphrase(), "lounge")
+                       for _ in range(2000))
+
+
 # ------------------------------------------------------------ clean_handle
 class TestCleanHandle:
     def test_colon_removed_so_a_handle_cannot_forge_a_header(self):
@@ -95,6 +107,13 @@ class TestCleanHandle:
 
     def test_limit(self):
         assert len(ts.clean_handle("x" * 100)) <= 20
+
+    @pytest.mark.parametrize("raw", ["bob~3dc5", "bob\uff5e3dc5", "bob\u223c3dc5",
+                                     "bob\u02dc3dc5", "bob\u301c3dc5"])
+    def test_no_tilde_so_a_handle_cannot_pose_as_a_clash_label(self, raw):
+        """alice~3dc5 is how a second alice is shown. A handle that arrived
+        with the tilde already in it would look exactly like that."""
+        assert ts.clean_handle(raw) == "bob3dc5"
 
 
 # --------------------------------------------------------------- valid_onion

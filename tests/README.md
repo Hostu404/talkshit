@@ -3,7 +3,7 @@
     pip install pytest hypothesis pytest-timeout pytest-cov
     python3 -m pytest tests/ -q --timeout=400
 
-338 tests. Everything is isolated: `conftest.py` redirects the app's storage
+398 tests. Everything is isolated: `conftest.py` redirects the app's storage
 to a temporary directory, refuses any real network call, and fails a test
 that leaves a thread running.
 

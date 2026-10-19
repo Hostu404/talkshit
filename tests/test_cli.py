@@ -74,27 +74,42 @@ class TestWipe:
 
 class TestBridges:
     def test_shows_settings_without_hanging(self, home):
-        r = run("bridges", home=home, timeout=60, stdin=b"\n")
+        r = run("-k", "bridges", home=home, timeout=60, stdin=b"\n")
         assert r.returncode == 0
         assert b"Traceback" not in r.stderr
 
     def test_off_is_accepted(self, home):
-        r = run("bridges", "off", home=home, timeout=60)
+        r = run("-k", "bridges", "off", home=home, timeout=60)
         assert r.returncode == 0
 
     def test_auto_asks_before_reaching_out(self, home):
         """The built-in list is fetched in the clear, before tor is up. It
         must never happen without being asked."""
-        r = run("bridges", "auto", home=home, timeout=60, stdin=b"n\n")
+        r = run("-k", "bridges", "auto", home=home, timeout=60, stdin=b"n\n")
         combined = (r.stdout + r.stderr).decode().lower()
         assert "clear" in combined or "network will see" in combined \
                or "fetch them anyway" in combined
         assert r.returncode == 0
 
     def test_auto_declined_changes_nothing(self, home):
-        run("bridges", "auto", home=home, timeout=60, stdin=b"n\n")
+        run("-k", "bridges", "auto", home=home, timeout=60, stdin=b"n\n")
         state = os.path.join(home, "talkshit", "bridges.auto")
         assert not os.path.exists(state)
+
+    def test_pasted_lines_are_there_next_time(self, home):
+        line = b"obfs4 192.0.2.1:443 AAAA cert=abc iat-mode=0\n\n"
+        run("-k", "bridges", home=home, timeout=60, stdin=line)
+        r = run("-k", "bridges", home=home, timeout=60, stdin=b"\n")
+        assert b"1 bridge line(s) of your own" in r.stdout
+
+    def test_without_keep_state_nothing_pretends_to_be_saved(self, home):
+        """Settings saved without -k went into the temporary folder and were
+        deleted on exit - after the command had said 'saved'."""
+        line = b"obfs4 192.0.2.1:443 AAAA cert=abc iat-mode=0\n\n"
+        r = run("bridges", home=home, timeout=60, stdin=line)
+        out = r.stdout.decode()
+        assert r.returncode == 0
+        assert "saved 1 bridge" not in out and "-k bridges" in out and "--bridge" in out
 
 
 class TestNoTorAvailable:

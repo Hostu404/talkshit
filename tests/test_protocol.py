@@ -1,6 +1,6 @@
 """Message handling and the error paths. Everything here is fed through the
 real dispatch, with bodies a hostile peer could actually send."""
-import base64, os, queue, time
+import base64, os, queue, socket, threading, time
 import pytest
 import talkshit as ts
 
@@ -154,6 +154,34 @@ class TestRosterAndHandles:
         chat.mesh._dispatch(signed(room, kind="join", nick="b0b"), link)
         warned = [m["text"] for m in drain(chat, "sys")]
         assert any("handle" in w for w in warned)
+
+    def test_a_matching_tag_never_shares_a_label(self, chat, fake_link, signed,
+                                                 room):
+        """The clash tag is four hex characters, and a key with a chosen tag
+        takes seconds to find. Somebody already showing as bob~xxxx must not
+        be joined on screen by a second person with the same tag."""
+        import hashlib
+        link = fake_link(chat.mesh)
+        chat.mesh._dispatch(signed(room, kind="join", nick="bob"), link)
+        eve = ts.Identity()
+        digest = hashlib.sha256(eve.edpub).hexdigest()
+        with chat.roster:            # what a key ground to eve's tag looks like
+            chat.shown["somebody-else"] = f"bob~{digest[:4]}"
+        chat.mesh._dispatch(signed(room, kind="join", nick="bob", ident=eve), link)
+        drain(chat)
+        shown = chat.shown[base64.b64encode(eve.edpub).decode()]
+        assert shown == f"bob~{digest[:8]}"
+
+    def test_a_clash_label_stays_short_when_it_is_free(self, chat, fake_link,
+                                                       signed, room):
+        import hashlib
+        link = fake_link(chat.mesh)
+        chat.mesh._dispatch(signed(room, kind="join", nick="bob"), link)
+        eve = ts.Identity()
+        chat.mesh._dispatch(signed(room, kind="join", nick="bob", ident=eve), link)
+        drain(chat)
+        shown = chat.shown[base64.b64encode(eve.edpub).decode()]
+        assert shown == f"bob~{hashlib.sha256(eve.edpub).hexdigest()[:4]}"
 
     def test_displayed_time_is_arrival_not_claimed(self, chat, fake_link,
                                                    signed, room):
@@ -356,6 +384,75 @@ class TestTransientRendezvousFailures:
             mesh.stop.set(); mesh.close()
 
 
+class TestNotFoundWithTheDescriptorInHand:
+    """Observed over real tor: bob fetched alice's descriptor, sent the
+    connect, lost the rendezvous, and tor answered 0xF0 - no such onion. Her
+    door was read as free, bob opened his own, and neither reached the other
+    inside seven minutes."""
+
+    def _transport(self, held, succeed_after=99):
+        flaky = TestTransientRendezvousFailures()._transport(0xF0, succeed_after)
+        flaky.holds_descriptor = lambda address: address in held
+        return flaky
+
+    def test_an_occupied_door_is_not_called_free(self, room):
+        tr = self._transport(held={"live"})
+        mesh = ts.Mesh(tr, room, publish=False)
+        try:
+            door = type("D", (), {"address": "live", "slot": 0})()
+            assert mesh._probe([door], timeout=1.0) == []
+            assert tr.attempts["live"] >= 2, "it was never dialled again"
+        finally:
+            mesh.stop.set(); mesh.close()
+
+    def test_the_retry_reaches_whoever_is_there(self, room):
+        tr = self._transport(held={"live"}, succeed_after=1)
+        mesh = ts.Mesh(tr, room, publish=False)
+        try:
+            door = type("D", (), {"address": "live", "slot": 0})()
+            mesh._probe([door], timeout=1.0)
+            assert mesh.probe_notes["live"][0] == "answered - linked"
+        finally:
+            mesh.stop.set(); mesh.close()
+
+    def test_without_the_descriptor_it_is_still_free(self, room):
+        tr = self._transport(held=set())
+        mesh = ts.Mesh(tr, room, publish=False)
+        try:
+            door = type("D", (), {"address": "empty", "slot": 0})()
+            assert mesh._probe([door], timeout=1.0) == [door]
+        finally:
+            mesh.stop.set(); mesh.close()
+
+    def _control(self, reply):
+        a, b = socket.socketpair()
+        ctl = ts.Control.__new__(ts.Control)
+        ctl.sock, ctl.f = a, a.makefile("rwb")
+
+        def serve():
+            f = b.makefile("rwb")
+            f.readline()
+            f.write(reply)
+            f.flush()
+            f.readline()
+            f.write(b"250-version=0.4.9\r\n250 OK\r\n")
+            f.flush()
+        threading.Thread(target=serve, daemon=True).start()
+        return ctl
+
+    def test_a_cached_descriptor_is_read_to_the_end(self, room):
+        # descriptor lines that happen to look like replies must not end it
+        ctl = self._control(b"250+hs/client/desc/id/x=\r\nhs-descriptor 3\r\n"
+                            b"551 not a reply\r\n250 nor this\r\n.\r\n250 OK\r\n")
+        assert ctl.holds_descriptor("x.onion") is True
+        assert ctl.cmd("GETINFO version") == ["version=0.4.9", "OK"]
+
+    def test_no_cached_descriptor(self, room):
+        ctl = self._control(b"551 Couldn't find a descriptor for x\r\n")
+        assert ctl.holds_descriptor("x.onion") is False
+        assert ctl.cmd("GETINFO version") == ["version=0.4.9", "OK"]
+
+
 class TestNothingTravelsUnnamed:
     """Duplicate detection is the only thing stopping a relayed body going
     round the mesh for ever, and it keys on the id. A signed message with no
@@ -439,3 +536,77 @@ class TestOneMemberCannotSpendAnothersAllowance:
         for i in range(4000):
             chat.mesh._flooding(f"speaker{i % 500}", links[i % 6])
         assert len(chat.mesh.rates) <= ts.MAX_ROSTER * 4
+
+
+class TestRoomListGoodbyes:
+    """A room is meant to leave the list seconds after its last person goes.
+    Two things kept it there for minutes: only the last person out sent a
+    goodbye, so whoever left earlier stayed on record as an announcer, and
+    listings repeated second hand put a closed room straight back."""
+
+    @pytest.fixture
+    def index(self, stub_transport):
+        i = ts.Index(stub_transport, publish=False)
+        yield i
+        i.close()
+
+    @staticmethod
+    def said(index, kind, who, **fields):
+        body = {"kind": kind, "room": "lounge", "ts": time.time(),
+                "from": base64.b64encode(who.edpub).decode(), **fields}
+        index._on_object(body, None)
+
+    def test_the_room_goes_when_everyone_has_said_goodbye(self, index):
+        alice, bob = ts.Identity(), ts.Identity()
+        self.said(index, "room", alice, n=2, fp="lounge000001")
+        self.said(index, "room", bob, n=2, fp="lounge000001")
+        self.said(index, "drop", bob)              # bob leaves; alice still here
+        assert "lounge" in dict(index.rooms())
+        self.said(index, "drop", alice)            # the last one out
+        assert "lounge" not in dict(index.rooms())
+
+    def test_second_hand_listings_do_not_bring_it_back(self, index):
+        alice = ts.Identity()
+        self.said(index, "room", alice, n=1, fp="lounge000001")
+        self.said(index, "drop", alice)
+        relay = ts.Identity()
+        self.said(index, "room", relay, n=1, fp="lounge000001", fwd=True,
+                  by=base64.b64encode(alice.edpub).decode())
+        assert "lounge" not in dict(index.rooms())
+
+    def test_a_late_copy_of_an_old_announcement_is_ignored(self, index):
+        alice = ts.Identity()
+        old = time.time()
+        self.said(index, "room", alice, n=1, fp="lounge000001")
+        self.said(index, "drop", alice)
+        index._on_object({"kind": "room", "room": "lounge", "n": 1, "fp": "lounge000001",
+                          "ts": old - 1,
+                          "from": base64.b64encode(alice.edpub).decode()}, None)
+        assert "lounge" not in dict(index.rooms())
+
+    def test_announcing_again_reopens_it(self, index):
+        alice = ts.Identity()
+        self.said(index, "room", alice, n=1, fp="lounge000001")
+        self.said(index, "drop", alice)
+        time.sleep(0.01)
+        self.said(index, "room", alice, n=1, fp="lounge000001")
+        assert "lounge" in dict(index.rooms())
+
+    def test_leaving_always_takes_our_claim_back(self, index):
+        sent = []
+        index.mesh.broadcast = lambda obj, skip=None: sent.append(obj)
+        index.publish("lounge", lambda: 2, "lounge000001")
+        index.unpublish(last_one_out=False)     # others are still in the room
+        assert any(o.get("kind") == "drop" and o.get("room") == "lounge" for o in sent)
+
+
+class TestClockSkew:
+    def test_a_far_off_clock_is_noticed(self, chat, fake_link, signed, room):
+        """Bodies more than CLOCK_SLACK out are refused - that is the replay
+        window. Two people with clocks that far apart used to connect and then
+        simply never see each other, with nothing to say why."""
+        link = fake_link(chat.mesh)
+        chat.mesh._dispatch(signed(room, kind="msg", nick="bob", text="hi",
+                                   ts=time.time() + 2 * 3600), link)
+        assert drain(chat, "msg") == []
+        assert 2 * 3600 - 60 < chat.mesh.clock_off < 2 * 3600 + 60

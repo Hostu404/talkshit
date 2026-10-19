@@ -12,7 +12,7 @@ talk shit - serverless encrypted chatrooms over tor.
                                   needed if tor is not installed)
     python3 talkshit.py doctor    check tor and report what works
     python3 talkshit.py selftest  two tors, a real room, a real message
-    python3 talkshit.py bridges   bridge settings (off by default)
+    python3 talkshit.py -k bridges  bridge settings, kept between runs
     python3 talkshit.py wipe      remove everything it put on disk
 
 There is no server. A room's passphrase derives a small fixed set of v3 onion
@@ -215,6 +215,10 @@ def use_storage(keep: bool) -> None:
     else:
         sweep_abandoned()
         HOME = _TEMP_ROOT = tempfile.mkdtemp(prefix="ts-")
+        # who this folder belongs to, so another copy starting up can tell it
+        # is in use (see sweep_abandoned)
+        with open(os.path.join(HOME, OWNER_FILE), "w") as f:
+            f.write(str(os.getpid()))
     _bind_paths()
 
 
@@ -272,16 +276,16 @@ def sweep_abandoned() -> None:
     for path in glob.glob(os.path.join(tempfile.gettempdir(), "ts-*")):
         if os.path.islink(path) or not os.path.isdir(path):
             continue                    # a planted symlink is not ours to follow
-        lock = os.path.join(path, "tordata", "lock")
-        try:
-            if os.path.isfile(lock):
-                with open(lock) as f:
-                    pid = int(f.read().strip() or "0")
-                if pid > 0:
-                    os.kill(pid, 0)
-                    continue            # still in use by a running copy
-        except (OSError, ValueError):
-            pass                        # no lock, or the holder is gone
+        # In use while the copy that made it is running, or its tor is. This
+        # used to read a pid out of tor's lock file, which tor leaves empty -
+        # it is a lock, not a pid file - so every folder past a minute old
+        # read as abandoned, and starting a second copy deleted the first
+        # one's tor data from under it. That copy carried on, but could no
+        # longer publish or republish a door.
+        pids = [read_pid(os.path.join(path, OWNER_FILE))]
+        pids += [read_pid(p) for p in glob.glob(os.path.join(path, "tordata*", TOR_PID_FILE))]
+        if any(pid_alive(pid) for pid in pids):
+            continue
         try:
             if time.time() - os.path.getmtime(path) > 60:
                 shutil.rmtree(path, ignore_errors=True)
@@ -309,6 +313,9 @@ PAD_TO = 256             # message bodies are padded to a multiple of this
 # them is what keeps joining cheap however large the room grows: everyone
 # probes these and nothing else, and the people behind them hand out the
 # addresses of everyone else.
+OWNER_FILE = "owner"     # our pid, in a temporary home
+TOR_PID_FILE = "tor.pid" # tor's pid, in its data directory. tor's own "lock"
+                         # file is empty - a lock, not a record of who holds it
 DOORS = 16
 DOOR_EPOCH = 3600.0      # doors move to fresh addresses this often
 DOOR_OVERLAP = 600.0     # and the old ones stay up this long after they do
@@ -377,6 +384,7 @@ NEW_KEY_BUDGET = 30      # bodies a just-met key may send until it settles.
                          # minute. LINK_RATE_LIMIT is the real ceiling - this
                          # only stops one identity laundering through many
 KX_PATIENCE = 20.0       # a circuit that never agrees keys is not a peer
+OWN_OFFER_MEMORY = KX_PATIENCE * 6   # how long our own key offers are recognised
 RATE_WINDOW = 10.0
 INDEX_PER_KEY = 5        # rooms one announcer may list, so nobody floods it
 PROBE_TIMEOUT = 75.0     # a slow onion must not be read as an empty door
@@ -564,23 +572,39 @@ class PublicIndex(Secret):
 
 
 class Identity:
-    """Ephemeral keys for this run. Generated in memory, never written down,
-    gone when the process exits - which is what makes the traffic forward
-    secret: a passphrase leaking later cannot decrypt anything recorded."""
+    """The signing key for this run. Generated in memory, never written down,
+    gone when the process exits. Key agreement does not use it: every circuit
+    makes its own pair (see link_keypair), which is what makes the traffic
+    forward secret."""
 
     def __init__(self):
-        self.x = X25519PrivateKey.generate()
-        self.xpub = self.x.public_key().public_bytes(
-            encoding=serialization.Encoding.Raw,
-            format=serialization.PublicFormat.Raw)
         self.ed = Ed25519PrivateKey.generate()
         self.edpub = self.ed.public_key().public_bytes(
             encoding=serialization.Encoding.Raw,
             format=serialization.PublicFormat.Raw)
-        self.fingerprint = hashlib.sha256(self.edpub).hexdigest()[:8]
+        self.fingerprint = key_fingerprint(self.edpub)
 
     def sign(self, payload: bytes) -> bytes:
         return self.ed.sign(payload)
+
+
+def key_fingerprint(edpub: bytes) -> str:
+    """What /who shows beside a name, to compare out of band. It was eight hex
+    characters - thirty two bits, which a vanity key generator matches in
+    minutes. Sixteen puts a lookalike key out of reach."""
+    return hashlib.sha256(edpub).hexdigest()[:16]
+
+
+def link_keypair() -> tuple[X25519PrivateKey, bytes]:
+    """A key pair for one circuit's key agreement, thrown away once the keys
+    are agreed. There used to be one per room session, shared by every
+    circuit: two circuits to the same peer then agreed identical keys, and
+    the private half lived for as long as the room stayed open - forward
+    secret per session, not per connection as promised."""
+    private = X25519PrivateKey.generate()
+    return private, private.public_key().public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw)
 
 
 def _no_specials(text: str):
@@ -678,7 +702,8 @@ SOCKS_ERRORS = {1: "general failure", 2: "not allowed", 3: "network unreachable"
                 0xF6: "onion address invalid",
                 0xF7: "onion introduction timed out"}
 
-# The only reply that means an address is genuinely unused. Everything else,
+# The only reply that means an address is genuinely unused - and even this one
+# only when tor holds no descriptor for it (see _probe). Everything else,
 # including plain host-unreachable, may well be a live peer having a bad
 # minute, and claiming its address would put two peers on one door.
 NO_SUCH_ONION = {0xF0}
@@ -784,6 +809,26 @@ class Control:
         except OSError:
             pass
 
+    def holds_descriptor(self, address: str) -> bool:
+        """Whether tor's client cache has a descriptor for this onion. The
+        answer is the descriptor itself, sent as a data block, which cmd()
+        cannot read: its lines are not replies, and one could look like one."""
+        onion = address.replace(".onion", "")
+        self.f.write(f"GETINFO hs/client/desc/id/{onion}\r\n".encode())
+        self.f.flush()
+        found = in_data = False
+        while True:
+            raw = self.f.readline()
+            if not raw:
+                raise OSError("control connection closed")
+            text = raw.decode(errors="replace").rstrip("\r\n")
+            if in_data:
+                in_data = text != "."
+            elif text[3:4] == "+":
+                found = in_data = True
+            elif text[3:4] == " ":
+                return found and text.startswith("250")
+
     def close(self) -> None:
         try:
             self.sock.close()
@@ -835,6 +880,44 @@ def looks_like_tor(pid: int) -> bool:
                              capture_output=True, text=True, timeout=15)
         return out.returncode == 0 and "tor" in out.stdout.strip().lower()
     except (OSError, ValueError, subprocess.SubprocessError):
+        return False
+
+
+def read_pid(path: str) -> int:
+    try:
+        with open(path) as f:
+            return int(f.read().split()[0])
+    except (OSError, ValueError, IndexError):
+        return 0
+
+
+def pid_alive(pid: int) -> bool:
+    """Whether a process is running, without touching it. os.kill(pid, 0) is
+    that question on unix, but on windows os.kill terminates whatever it is
+    pointed at, signal 0 included - so windows asks the kernel instead. When
+    the answer is not clear, say alive: callers use this to decide whether
+    something may be deleted or killed."""
+    if pid <= 0:
+        return False
+    if sys.platform.startswith("win"):
+        try:
+            import ctypes
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            handle = kernel32.OpenProcess(0x1000, False, pid)  # QUERY_LIMITED_INFORMATION
+            if not handle:
+                return ctypes.get_last_error() == 5             # access denied: exists
+            code = ctypes.c_ulong()
+            ok = kernel32.GetExitCodeProcess(handle, ctypes.byref(code))
+            kernel32.CloseHandle(handle)
+            return not ok or code.value == 259                  # STILL_ACTIVE
+        except Exception:
+            return True
+    try:
+        os.kill(pid, 0)
+        return True
+    except PermissionError:
+        return True
+    except OSError:
         return False
 
 
@@ -1453,18 +1536,18 @@ def stall_advice(phase: int) -> list[str]:
                "first to be blocked or overloaded. any of these help:",
                ""]
         for command, why in (
-                ("python3 talkshit.py bridges",
-                 "paste your own from bridges.torproject.org"),
+                ("python3 talkshit.py -k bridges",
+                 "paste your own from bridges.torproject.org, then start with -k"),
                 (snowflake,
                  "a transport that needs no bridge address at all"),
-                ("python3 talkshit.py bridges off",
+                ("python3 talkshit.py -k bridges off",
                  "connect directly: faster, but your network sees tor")):
             out.append(f"  {command}")
             out.append(f"      {why}")
         return out
     if phase >= 50:
         return [f"stuck at {phase}% - tor cannot reach a guard relay.",
-                "if tor is blocked here, 'python3 talkshit.py bridges' helps"]
+                "if tor is blocked here, 'python3 talkshit.py -k bridges' helps"]
     return [f"stuck at {phase}% - no route to the tor network yet.",
             "check the connection; this is usually not talk shit's doing"]
 
@@ -1494,7 +1577,7 @@ class TorFailed(OSError):
                     "internet connection")
             if not read_bridges():
                 hint += (". if tor is blocked on this network, try "
-                         "'python3 talkshit.py bridges'")
+                         "'python3 talkshit.py -k bridges'")
             return hint
         if not self.output:
             return "tor produced no output at all - is that file really a tor binary?"
@@ -1554,6 +1637,7 @@ class Tor:
                  "SafeLogging 1",
                  "Log notice stdout",
                  f"DataDirectory {torrc_value(self.data_dir)}",
+                 f"PidFile {torrc_value(os.path.join(self.data_dir, TOR_PID_FILE))}",
                  "AvoidDiskWrites 1"]
         bridges = usable_bridges(active_bridges())
         if bridges:
@@ -1563,8 +1647,8 @@ class Tor:
             # something that happens quietly because a binary was missing
             raise TorFailed(
                 "bridges are on but none are usable here. install a transport "
-                f"({transport_hint()}), run 'python3 talkshit.py bridges' to "
-                "paste your own, or 'bridges off' to accept a direct, visible "
+                f"({transport_hint()}), run 'python3 talkshit.py -k bridges' to "
+                "paste your own, or '-k bridges off' to accept a direct, visible "
                 "connection", [])
         for name, option in (("geoip", "GeoIPFile"), ("geoip6", "GeoIPv6File")):
             path = find_data_file(name)
@@ -1685,18 +1769,12 @@ class Tor:
         lock = os.path.join(self.data_dir, "lock")
         if not os.path.isfile(lock):
             return
-        try:
-            with open(lock) as f:
-                pid = int((f.read().strip() or "0"))
-        except (OSError, ValueError):
-            pid = 0
-        alive = False
-        if pid > 1 and pid != os.getpid() and looks_like_tor(pid):
-            try:
-                os.kill(pid, 0)
-                alive = True
-            except OSError:
-                alive = False
+        # the pid comes from the PidFile line in our torrc. it used to be read
+        # out of the lock file, which tor leaves empty, so a leftover tor was
+        # never found and never ended
+        pid = read_pid(os.path.join(self.data_dir, TOR_PID_FILE))
+        alive = (pid > 1 and pid != os.getpid() and looks_like_tor(pid)
+                 and pid_alive(pid))
         if alive:
             self.status(f"  ending a leftover tor (pid {pid})...")
             for sig in (signal.SIGTERM, getattr(signal, "SIGKILL", signal.SIGTERM)):
@@ -1706,9 +1784,7 @@ class Tor:
                     break               # already gone
                 for _ in range(20):
                     time.sleep(0.25)
-                    try:
-                        os.kill(pid, 0)
-                    except OSError:
+                    if not pid_alive(pid):
                         break
                 else:
                     continue
@@ -1771,6 +1847,20 @@ class Transport:
             if self._ctl:
                 self._ctl.del_onion(address)
 
+    def holds_descriptor(self, address: str) -> bool:
+        """Asked on a connection of its own. The one in _ctl owns every onion
+        we publish, and a reply misread on it would take them all down."""
+        try:
+            ctl = self.tor.control()
+        except OSError:
+            return False
+        try:
+            return ctl.holds_descriptor(address)
+        except OSError:
+            return False
+        finally:
+            ctl.close()
+
     def _watchdog(self) -> None:
         """Republish everything if tor's control connection ever drops."""
         while not self.stop.wait(60):
@@ -1825,11 +1915,11 @@ def ensure_bridges(status=print) -> None:
     print("  watching your connection would see it, and that is the one thing")
     print("  bridges are for hiding - so this is not done for you.")
     print("\n  get bridges somewhere out of the way and paste them in:")
-    print("      python3 talkshit.py bridges")
+    print("      python3 talkshit.py -k bridges")
     print("  by email  : bridges@torproject.org, body 'get transport obfs4'")
     print("  in browser: Tor Browser > Settings > Connection > Bridges")
     print("\n  or fetch them anyway, knowing what it shows:")
-    print("      python3 talkshit.py bridges auto\n")
+    print("      python3 talkshit.py -k bridges auto\n")
 
 
 def refresh_bridges_over_tor(transport: "Transport") -> None:
@@ -1954,6 +2044,11 @@ class Link:
         self.opened = self.last_heard = time.time()
         self.useful = False          # has anything ever arrived over this?
         self.lock = threading.Lock()
+        # made before the reader starts, since a key offer can arrive at once.
+        # the mesh remembers every one we offer, which is how a circuit that
+        # reached our own door is told apart from one that reached a peer
+        self._x, self._xpub = link_keypair()
+        mesh.offered(self._xpub)
         threading.Thread(target=self._read, daemon=True).start()
         threading.Thread(target=self._write, daemon=True).start()
         self.handshake()
@@ -1961,9 +2056,8 @@ class Link:
     # -- key agreement -----------------------------------------------------
 
     def handshake(self) -> None:
-        me = self.mesh.ident
         self._room_send({"kind": "kx", "v": PROTOCOL,
-                         "epk": base64.b64encode(me.xpub).decode()})
+                         "epk": base64.b64encode(self._xpub).decode()})
 
     def _on_kx(self, obj: dict) -> None:
         if self._tx is not None:
@@ -1978,15 +2072,22 @@ class Link:
             epk = base64.b64decode(obj.get("epk", ""))
             if len(epk) != 32:
                 raise ValueError("bad key length")
-            me = self.mesh.ident
-            if epk == me.xpub:
-                raise ValueError("that is our own key")
-            tx, rx = link_keys(me.x, me.xpub, epk, self.mesh.secret.key)
+            if self.mesh.is_ours(epk):
+                # we dialled one of our own doors. claiming a door depends on
+                # this: a circuit that reached ourselves must never come up,
+                # or it reads as somebody else holding the same door
+                raise ValueError("that is one of our own circuits")
+            with self.lock:
+                private = self._x
+            if private is None:
+                raise ValueError("this circuit has already closed")
+            tx, rx = link_keys(private, self._xpub, epk, self.mesh.secret.key)
         except Exception:
             self.drop()
             return
         with self.lock:
             self._tx, self._rx = tx, rx
+            self._x = None           # agreed: nothing left for it to protect
             queued, self._pending = self._pending, []
         for obj in queued:
             self.send(obj)
@@ -2049,7 +2150,7 @@ class Link:
             stream = self.sock.makefile("rb")
             while True:
                 line = stream.readline(MAX_FRAME)
-                if not line:
+                if not line or not self.alive:
                     return
                 if not line.endswith(b"\n"):
                     return           # oversized frame: hang up rather than buffer
@@ -2152,7 +2253,16 @@ class Link:
         if not self.alive:
             return
         self.alive = False
+        self._x = None
         self.out.put(None)
+        try:
+            # close() alone does not hang up. The reader's makefile holds the
+            # socket open until it is closed as well, so a dropped peer never
+            # heard we had gone, kept talking, and the reader kept handling
+            # what it said
+            self.sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
         try:
             self.sock.close()
         except OSError:
@@ -2207,6 +2317,8 @@ class Mesh:
         self.on_object = on_object or (lambda obj, link: None)
         self.hello = hello or {"kind": "hello"}
         self.links: list[Link] = []
+        self.own_epks: dict[bytes, float] = {}   # our key offers -> when made
+        self._epk_lock = threading.Lock()
         self.known: dict[str, float] = {}    # address -> when we last heard of it
         self.gossiped: dict[str, list] = {}  # source -> when it spent its budget
         self.vouched: dict[str, set] = {}    # address -> who has vouched for it
@@ -2232,6 +2344,7 @@ class Mesh:
         self.epoch = door_epoch()
         self.probing = False
         self.mismatched = 0             # peers speaking another wire format
+        self.clock_off = 0.0            # how far out a refused body's clock was
         self.sweeps = 0
         # A loop here that throws every time would otherwise carry on failing
         # in silence for as long as the room is open, and silent degradation
@@ -2245,6 +2358,25 @@ class Mesh:
         self.listener.listen(64)
         self.local_port = self.listener.getsockname()[1]
         threading.Thread(target=self._accept_loop, daemon=True).start()
+
+    def offered(self, epk: bytes) -> None:
+        """Remember a key offer of ours, so a circuit that reached our own
+        door is recognised. Kept for a while rather than forgotten when the
+        circuit closes: the two ends of a circuit to ourselves read each
+        other's offer moments apart, and the first to notice hangs up. Had it
+        forgotten its offer then, the other end would agree keys with a
+        circuit that no longer existed - and claiming a door reads exactly
+        that as somebody else holding it."""
+        now = time.time()
+        with self._epk_lock:
+            for old in [k for k, when in self.own_epks.items()
+                        if now - when > OWN_OFFER_MEMORY]:
+                del self.own_epks[old]
+            self.own_epks[epk] = now
+
+    def is_ours(self, epk: bytes) -> bool:
+        with self._epk_lock:
+            return epk in self.own_epks
 
     # -- joining -----------------------------------------------------------
 
@@ -2398,11 +2530,22 @@ class Mesh:
                 self._forget_socket(sock)
             except SocksError as exc:
                 early = False
+                # 0xF0 is not always the truth. Against the live network tor
+                # was seen to fetch a door's descriptor, send the connect, lose
+                # the rendezvous, and then answer "no such onion". A joiner who
+                # knocked just after the door was claimed read it as free,
+                # opened a door of its own, and did not knock there again for
+                # minutes. A descriptor in tor's hands means somebody is there.
+                held = (exc.code in NO_SUCH_ONION
+                        and self._descriptor_held(identity.address))
                 with lock:
-                    if exc.code in NO_SUCH_ONION:
+                    if exc.code in NO_SUCH_ONION and not held:
                         free.append(identity)
                         early = self.publish and not self.address
                         note = "free (0xF0)"
+                    elif held:
+                        flaky.append(identity)
+                        note = "busy, retrying (0xF0 with descriptor in hand)"
                     elif exc.code in TRANSIENT_ONION:
                         flaky.append(identity)   # worth another try, never free
                         note = f"busy, retrying (0x{exc.code:02X})"
@@ -2761,6 +2904,10 @@ class Mesh:
         except TypeError:
             return self.transport.connect(address, timeout, self.socks_auth)
 
+    def _descriptor_held(self, address: str) -> bool:
+        check = getattr(self.transport, "holds_descriptor", None)
+        return bool(check and check(address))
+
     def _note_probe(self, address: str, outcome: str) -> None:
         with self.lock:
             self.probe_notes[address] = (outcome, time.time())
@@ -2982,6 +3129,10 @@ class Mesh:
         except (TypeError, ValueError, OverflowError):  # replayed capture
             return                                      # looks like
         if not math.isfinite(stamp) or abs(stamp - time.time()) > CLOCK_SLACK:
+            if math.isfinite(stamp):
+                # signed by a member, so most likely a clock set wrong. say so:
+                # otherwise two people connect and simply never see each other
+                self.clock_off = stamp - time.time()
             return
         sender = str(obj.get("from", ""))
         mid = str(obj.get("id", ""))
@@ -3075,6 +3226,8 @@ class Index:
         self.claims: dict[str, dict[str, set]] = {}       # name -> fp -> announcers
         self.announcers: dict[str, set] = {}              # name -> keys announcing it
         self.by_key: dict[str, set] = {}                  # key -> names it announces
+        self.dropped: dict[str, float] = {}               # name -> when it emptied
+        self.retired: dict[tuple, tuple] = {}             # (name, key) -> (their stamp, ours)
         self.mine: str | None = None
         # Six dicts, mutated by every link thread that carries an
         # announcement and read by whoever is drawing the room list. Wrapping
@@ -3126,6 +3279,10 @@ class Index:
             for name in [n for n, (_, seen) in list(self.entries.items())
                          if now - seen >= ttl]:
                 self._forget(name)
+            for name in [n for n, when in self.dropped.items() if now - when >= ttl]:
+                del self.dropped[name]
+            for key in [k for k, (_, when) in self.retired.items() if now - when >= ttl]:
+                del self.retired[key]
             return sorted((n, c) for n, (c, _) in self.entries.items()
                           if c > 0)
 
@@ -3149,12 +3306,21 @@ class Index:
             self._announce()
 
     def unpublish(self, last_one_out: bool) -> None:
+        """Take our own claim on the listing back, every time. A drop only
+        ever retires the sender's claim, so the room stays listed for as long
+        as anyone still in it announces it. Sending one only on the way out
+        of an empty room left everyone who had gone before on record as an
+        announcer, so the last goodbye never emptied the entry and a closed
+        room stayed listed until it expired, minutes later."""
         with self.lock:
             name, self.mine = self.mine, None
-            if name and last_one_out:
-                self.entries.pop(name, None)
-                self.mesh.broadcast({"kind": "drop", "room": name,
-                                     "id": os.urandom(8).hex()})
+            if not name:
+                return
+            self.mesh.broadcast({"kind": "drop", "room": name,
+                                 "id": os.urandom(8).hex()})
+            if last_one_out:
+                self._forget(name)
+                self.dropped[name] = time.time()
 
     def _announce(self) -> None:
         if not self.mine:
@@ -3227,6 +3393,13 @@ class Index:
                     # kept alive by people merely repeating each other, and it
                     # never counts as a claim on the name
                     now = time.time()
+                    # Nor does it bring back a room whose last announcer has just
+                    # said goodbye. Copies of the listing are always travelling -
+                    # a search, a newcomer's sample - and each one that arrived
+                    # after the goodbye used to put the room straight back, on
+                    # every peer, until it expired minutes later.
+                    if now - self.dropped.get(name, 0.0) < self.entry_ttl():
+                        return
                     if name not in self.entries and len(self.entries) < MAX_ENTRIES:
                         self.entries[name] = (count, now)
                         # carry whoever actually announced it, so the room can
@@ -3244,6 +3417,11 @@ class Index:
                             self.announcers.setdefault(name, set()).add(said_by)
                     return
                 sender = str(obj.get("from", ""))[:64]
+                gone = self.retired.get((name, sender))
+                stamp = obj.get("ts", 0)
+                if (gone and isinstance(stamp, (int, float))
+                        and stamp <= gone[0]):
+                    return       # sent before that announcer's own goodbye
                 if sender not in self.by_key and len(self.by_key) >= MAX_ENTRIES:
                     self._compact()
                     if len(self.by_key) >= MAX_ENTRIES:
@@ -3302,9 +3480,18 @@ class Index:
                 self.entries[name] = (count, time.time())
                 self.announcers.setdefault(name, set()).add(sender)
                 mine.add(name)
+                self.dropped.pop(name, None)     # announced afresh: it is open
             elif kind == "drop":
                 name = clean_name(str(obj.get("room", "")))
                 sender = str(obj.get("from", ""))
+                # remembered whether or not we hold their claim yet: relays can
+                # deliver a goodbye before the announcement it follows
+                try:
+                    said = float(obj.get("ts", 0))
+                except (TypeError, ValueError, OverflowError):
+                    said = 0.0
+                if len(self.retired) < MAX_ENTRIES:
+                    self.retired[(name, sender[:64])] = (said, time.time())
                 # a drop only retires the sender's own claim. anyone can announce a
                 # room, so treating a drop as deletion would let a stranger clear
                 # the list by announcing a room and immediately dropping it
@@ -3315,6 +3502,7 @@ class Index:
                 self.by_key.get(sender, set()).discard(name)
                 if not holders:
                     self._forget(name)
+                    self.dropped[name] = time.time()
 
     def close(self) -> None:
         self.stop.set()
@@ -3519,10 +3707,20 @@ class Chat:
                                    mine if look == folded(self.nick) else None)
             if taken and taken != sender:
                 try:
-                    tag = hashlib.sha256(base64.b64decode(sender)).hexdigest()[:4]
+                    digest = hashlib.sha256(base64.b64decode(sender)).hexdigest()
                 except Exception:
-                    tag = "????"
-                label = f"{claimed}~{tag}"
+                    digest = hashlib.sha256(sender.encode()).hexdigest()
+                # Four characters is short enough to read, but it is sixteen
+                # bits: a fresh key whose tag matches somebody's takes seconds
+                # to find, and then two people are one name on screen again.
+                # So a tag that is already showing grows until it is not.
+                showing = {folded(shown) for key, shown in self.shown.items()
+                           if key != sender}
+                size = 4
+                label = f"{claimed}~{digest[:size]}"
+                while folded(label) in showing and size < len(digest):
+                    size *= 2
+                    label = f"{claimed}~{digest[:size]}"
                 warn = (f"another person is using the handle {claimed}; "
                         f"showing them as {label}")
             else:
@@ -3597,7 +3795,7 @@ class Chat:
             key = by_label.get(nick)
             if key:
                 try:
-                    parts.append(f"{nick} ({hashlib.sha256(base64.b64decode(key)).hexdigest()[:8]})")
+                    parts.append(f"{nick} ({key_fingerprint(base64.b64decode(key))})")
                     continue
                 except Exception:
                     pass
@@ -3900,6 +4098,16 @@ def chat_ui(stdscr, chat: Chat) -> None:
                                          f" - if that does not match what /who "
                                          f"shows them, you are not in the same "
                                          f"room"})
+        if chat.mesh.clock_off and "clock" not in told:
+            told.add("clock")
+            minutes = max(1, round(abs(chat.mesh.clock_off) / 60))
+            messages.append({"type": "sys",
+                             "text": f"someone here has a clock {minutes} minutes "
+                                     f"{'ahead of' if chat.mesh.clock_off > 0 else 'behind'}"
+                                     f" yours. anything more than "
+                                     f"{CLOCK_SLACK / 60:.0f} minutes out is refused, "
+                                     f"so neither of you will see the other until "
+                                     f"one of you sets the right time"})
         if chat.mesh.faults and "faults" not in told:
             told.add("faults")
             messages.append({"type": "sys",
@@ -4097,6 +4305,24 @@ def _forms(text: str) -> set:
     return shapes or {text.strip().casefold()}
 
 
+_WALKS = ("0123456789", "abcdefghijklmnopqrstuvwxyz",
+          "qwertyuiopasdfghjklzxcvbnm", "1234567890")
+
+
+def _is_walk(text: str) -> bool:
+    """Every character the next one along a row of the keyboard or the
+    alphabet, either way, wrapping round: 123456789012, qwertyuiopas,
+    zyxwvutsrqpo. Long enough to pass the length check and nowhere near any
+    word list, but among the first things anyone grinding a room would try."""
+    for row in _WALKS:
+        for seq in (row, row[::-1]):
+            at = [seq.find(c) for c in text]
+            if len(at) > 1 and -1 not in at and all(
+                    (b - a) % len(seq) == 1 for a, b in zip(at, at[1:])):
+                return True
+    return False
+
+
 def weak_passphrase(passphrase: str, room: str = "") -> str | None:
     """The only thing standing between a room and the world. Checked here
     rather than in the menu, because every way into a room comes through
@@ -4109,6 +4335,8 @@ def weak_passphrase(passphrase: str, room: str = "") -> str | None:
     units = {_repeated_unit(v) for v in shapes}
     if (shapes | units) & _COMMON:
         return "that is one of the first phrases anyone would guess - pick another"
+    if any(len(v) >= 6 and _is_walk(v) for v in shapes | units):
+        return "that is a run along the keyboard or the alphabet - easy to guess"
     if any(u != v and len(u) < MIN_PASSPHRASE
            for v in shapes for u in (_repeated_unit(v),)):
         return "that is a short phrase said twice - it is as easy to guess as once"
@@ -4136,9 +4364,27 @@ def weak_passphrase(passphrase: str, room: str = "") -> str | None:
     return None
 
 
+def keeping_state() -> bool:
+    return not _TEMP_ROOT
+
+
 def bridges_command(args: list[str]) -> None:
     """Bridges hide the fact that you use tor, and get you onto it from a
     network that blocks it. They cost bootstrap speed, so they are opt in."""
+    if not keeping_state():
+        # Without -k the settings land in the temporary folder, which goes
+        # when this command does. It used to say "saved" anyway, and the next
+        # run started with nothing - while every hint about a blocked network
+        # sent people here.
+        print("\n  bridge settings need somewhere to live between runs, and by")
+        print("  default talk shit keeps nothing - anything saved now would be")
+        print("  gone the moment this command finished. two ways round that:\n")
+        print("      python3 talkshit.py -k bridges")
+        print("          keeps them in the platform's app-data folder. start talk")
+        print("          shit with -k from then on, so it reads them")
+        print("      python3 talkshit.py --bridge 'LINE'")
+        print("          a bridge for one run, with nothing written down\n")
+        return
     current = read_bridges()
     if args and args[0] == "off":
         set_builtins(False)
@@ -4156,7 +4402,7 @@ def bridges_command(args: list[str]) -> None:
         print("  bridges you were given privately work far better.")
         try:
             if not input("\n  fetch them anyway? [y/N]: ").strip().lower().startswith("y"):
-                print("\n  nothing changed. 'python3 talkshit.py bridges' takes"
+                print("\n  nothing changed. 'python3 talkshit.py -k bridges' takes"
                       " lines you paste.\n")
                 return
         except (EOFError, KeyboardInterrupt):
@@ -4177,7 +4423,7 @@ def bridges_command(args: list[str]) -> None:
         print(f"\n  {len(current)} bridge line(s) of your own:")
         for line in current:
             print(f"    {line.split()[0]}  {' '.join(line.split()[1:2])} ...")
-        print("\n  'talkshit.py bridges off' to stop using them\n")
+        print("\n  'talkshit.py -k bridges off' to stop using them\n")
 
     print("\n  tor connects directly by default. bridges hide that you use tor")
     print("  and get you onto it where it is blocked, at the cost of speed and")
@@ -4363,7 +4609,8 @@ def doctor() -> None:
     print(f"  tor binary : {find_tor() or 'not found (will be downloaded)'}")
     print(f"  data dir   : {HOME}")
     print("  files it writes, and nothing outside them:")
-    for path in (HOME, os.path.join(HOME, "tordata"), os.path.join(HOME, "torrc"),
+    for path in (HOME, os.path.join(HOME, OWNER_FILE), os.path.join(HOME, "tordata"),
+                 os.path.join(HOME, "torrc"),
                  os.path.join(HOME, "tor"), BRIDGE_FILE, AUTO_FILE, BRIDGES_ON):
         mark = "present" if os.path.exists(path) else "-"
         print(f"    {path}  ({mark})")
@@ -4589,11 +4836,21 @@ _CONFUSABLE = {
 }
 
 
+# A tilde marks a clashing handle on screen (alice~3dc5), so no handle may
+# carry one - nor anything drawn like one
+_TILDES = "~\u02dc\u2053\u223c\u301c\uff5e"
+
+
 def clean_handle(raw: str, limit: int = 20) -> str:
     """A handle is drawn as '<handle>: ' in front of what was said, so a colon
     inside one lets a single message carry two speakers and read as though
-    somebody else said the rest of the line. Nobody needs a colon in a name."""
-    return printable(raw, limit).replace(":", "").strip()
+    somebody else said the rest of the line. Nobody needs a colon in a name.
+
+    Nor a tilde: that is how a second person using a taken handle is shown.
+    A handle that came with one already could pass itself off as somebody
+    else's marked name without clashing with anything at all."""
+    text = printable(raw, limit).replace(":", "")
+    return "".join(c for c in text if c not in _TILDES).strip()
 
 
 def clean_name(raw: str) -> str:
